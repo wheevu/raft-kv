@@ -20,6 +20,14 @@ A Raft-backed key-value store in Rust with deterministic simulation, raw TCP tra
 - fsync-backed persistence for term, vote, log, and commit index
 - process-level kill/restart test
 
+## Current limitations
+
+- no log compaction or snapshots — the log grows forever
+- no dynamic membership changes
+- no TLS or authentication
+- no connection pooling — each send opens a fresh TCP connection
+- no read-index optimization — reads served from leader state machine only
+
 ## Shape of the system
 
 ```mermaid
