@@ -1,11 +1,12 @@
-use raft_kv::net::{WireMessage, read_frame, write_frame};
+use raft_kv::net::{WireMessage, read_frame, write_peer_frame, write_reply_frame};
+use raft_kv::storage::DurableState;
 use raft_kv::storage::{load_node, save_node};
-use raft_kv::{ClientReply, Node, NodeId};
+use raft_kv::{Node, NodeId};
 use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,9 +27,11 @@ fn run() -> io::Result<()> {
     let ids: Vec<_> = config.peers.keys().copied().collect();
     let peer_ids = ids.into_iter().filter(|&id| id != config.id).collect();
     let node = load_node(&config.state_path, config.id, peer_ids)?;
+    let last_saved = DurableState::from_node(&node);
     let shared = Arc::new(Mutex::new(Runtime {
         node,
         started: Instant::now(),
+        last_saved,
     }));
     let ticker = Arc::clone(&shared);
     let tick_config = config.clone();
@@ -39,7 +42,7 @@ fn run() -> io::Result<()> {
                 let mut runtime = ticker.lock().expect("node mutex poisoned");
                 let now = runtime.started.elapsed().as_millis() as u64;
                 let messages = runtime.node.tick(now);
-                if let Err(err) = save_node(&tick_config.state_path, &runtime.node) {
+                if let Err(err) = runtime.persist_if_changed(&tick_config.state_path) {
                     eprintln!("persist tick: {err}");
                 }
                 messages
@@ -77,36 +80,56 @@ fn handle_connection(
                 let mut runtime = shared.lock().expect("node mutex poisoned");
                 let now = runtime.started.elapsed().as_millis() as u64;
                 let replies = runtime.node.handle_message(message.from, message.rpc, now);
-                save_node(&config.state_path, &runtime.node)?;
+                if let Err(err) = runtime.persist_if_changed(&config.state_path) {
+                    eprintln!("persist peer message: {err}");
+                }
                 replies
             };
             send_all(&config.peers, replies);
         }
-        WireMessage::Client(request) => {
+        WireMessage::ClientRequest(request) => {
             let (reply, messages) = {
                 let mut runtime = shared.lock().expect("node mutex poisoned");
-                let (reply, messages) = runtime.node.handle_client_request(request);
-                save_node(&config.state_path, &runtime.node)?;
+                let (mut reply, messages) = runtime.node.handle_client_request(request);
+                if let Err(err) = runtime.persist_if_changed(&config.state_path) {
+                    eprintln!("persist client write: {err}");
+                    reply.success = false;
+                    reply.response = None;
+                }
                 (reply, messages)
             };
-            write_frame(&mut stream, &WireMessage::ClientReply(reply))?;
+            write_reply_frame(&mut stream, reply)?;
             send_all(&config.peers, messages);
         }
-        WireMessage::ClientReply(_) => {}
+        WireMessage::ClientReply(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected ClientReply from peer or client",
+            ));
+        }
     }
     Ok(())
 }
 
 fn send_all(peers: &HashMap<NodeId, String>, messages: Vec<raft_kv::Message>) {
+    let mut per_peer: HashMap<NodeId, Vec<raft_kv::Message>> = HashMap::new();
     for message in messages {
-        let Some(addr) = peers.get(&message.to) else {
+        per_peer.entry(message.to).or_default().push(message);
+    }
+    for (peer, msgs) in per_peer {
+        let Some(addr) = peers.get(&peer) else {
             continue;
         };
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
-                let _ = write_frame(&mut stream, &WireMessage::Peer(message));
+                for message in msgs {
+                    if let Err(err) = write_peer_frame(&mut stream, message) {
+                        eprintln!("send to {addr}: {err}");
+                        break;
+                    }
+                }
             }
-            Err(err) => eprintln!("send to {addr}: {err}"),
+            Err(err) => eprintln!("connect to {addr}: {err}"),
         }
     }
 }
@@ -114,6 +137,23 @@ fn send_all(peers: &HashMap<NodeId, String>, messages: Vec<raft_kv::Message>) {
 struct Runtime {
     node: Node,
     started: Instant,
+    last_saved: DurableState,
+}
+
+impl Runtime {
+    /// Persists if durable state differs from the last saved snapshot.
+    /// Compares fields directly — no log allocation on the fast path.
+    fn persist_if_changed(&mut self, path: &Path) -> io::Result<()> {
+        let needs_save = self.node.current_term() != self.last_saved.current_term
+            || self.node.voted_for() != self.last_saved.voted_for
+            || self.node.commit_index() != self.last_saved.commit_index
+            || self.node.log() != self.last_saved.log.as_slice();
+        if needs_save {
+            save_node(path, &self.node)?;
+            self.last_saved = DurableState::from_node(&self.node);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -150,14 +190,5 @@ impl Config {
             peers,
             state_path,
         })
-    }
-}
-
-#[allow(dead_code)]
-fn redirect_reply(node: &Node) -> ClientReply {
-    ClientReply {
-        success: false,
-        leader_id: node.leader_id(),
-        response: None,
     }
 }

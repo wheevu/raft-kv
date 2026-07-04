@@ -15,10 +15,10 @@ pub struct DurableState {
 impl DurableState {
     pub fn from_node(node: &Node) -> Self {
         Self {
-            current_term: node.current_term,
-            voted_for: node.voted_for,
-            log: node.log.clone(),
-            commit_index: node.commit_index,
+            current_term: node.current_term(),
+            voted_for: node.voted_for(),
+            log: node.log().to_vec(),
+            commit_index: node.commit_index(),
         }
     }
 }
@@ -86,7 +86,7 @@ mod tests {
     fn save_and_load_restores_term_vote_log_and_state_machine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.bin");
-        let mut node = Node::from_parts(
+        let node = Node::from_parts(
             0,
             vec![1, 2],
             4,
@@ -100,14 +100,12 @@ mod tests {
             }],
             1,
         );
-        node.voted_for = Some(2);
-
         save_node(&path, &node).unwrap();
         let loaded = load_node(&path, 0, vec![1, 2]).unwrap();
 
-        assert_eq!(loaded.current_term, 4);
-        assert_eq!(loaded.voted_for, Some(2));
-        assert_eq!(loaded.log, node.log);
+        assert_eq!(loaded.current_term(), 4);
+        assert_eq!(loaded.voted_for(), Some(2));
+        assert_eq!(loaded.log(), node.log());
         assert_eq!(loaded.get("foo"), Some("bar"));
     }
 }

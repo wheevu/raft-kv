@@ -1,5 +1,5 @@
 use raft_kv::net::{WireMessage, read_frame, write_frame};
-use raft_kv::{ClientReply, ClientRequest, Command, NodeId};
+use raft_kv::{ClientReply, ClientRequest, NodeId};
 use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -17,7 +17,7 @@ fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
     let reply = send_client(
         &peers[&leader],
-        Command::Set {
+        ClientRequest::Set {
             key: "foo".to_string(),
             value: "bar".to_string(),
         },
@@ -37,7 +37,7 @@ fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
         wait_for_leader_except(&peers, leader, Duration::from_secs(5)).expect("new leader elected");
     let reply = send_client(
         &peers[&new_leader],
-        Command::Set {
+        ClientRequest::Set {
             key: "baz".to_string(),
             value: "qux".to_string(),
         },
@@ -122,7 +122,7 @@ fn wait_for_leader_where(
         for addr in peers.values() {
             if let Ok(reply) = send_client(
                 addr,
-                Command::Get {
+                ClientRequest::Get {
                     key: "__probe__".to_string(),
                 },
             ) && let Some(id) = reply.leader_id.filter(|&id| accept(id))
@@ -141,7 +141,7 @@ fn wait_for_get(peers: &HashMap<NodeId, String>, key: &str, timeout: Duration) -
         for addr in peers.values() {
             if let Ok(reply) = send_client(
                 addr,
-                Command::Get {
+                ClientRequest::Get {
                     key: key.to_string(),
                 },
             ) && reply.success
@@ -155,16 +155,76 @@ fn wait_for_get(peers: &HashMap<NodeId, String>, key: &str, timeout: Duration) -
     None
 }
 
-fn send_client(addr: &str, command: Command) -> io::Result<ClientReply> {
+fn send_client(addr: &str, request: ClientRequest) -> io::Result<ClientReply> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-    write_frame(&mut stream, &WireMessage::Client(ClientRequest { command }))?;
+    write_frame(&mut stream, &WireMessage::ClientRequest(request))?;
     match read_frame(&mut stream)? {
         WireMessage::ClientReply(reply) => Ok(reply),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "expected client reply",
         )),
+    }
+}
+
+#[test]
+fn cluster_recovers_state_after_full_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let peers = reserve_ports(3);
+    let mut children = spawn_cluster(dir.path(), &peers);
+
+    let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
+    let reply = send_client(
+        &peers[&leader],
+        ClientRequest::Set {
+            key: "alpha".to_string(),
+            value: "bravo".to_string(),
+        },
+    )
+    .expect("set alpha");
+    assert!(reply.success);
+
+    assert_eq!(
+        wait_for_get(&peers, "alpha", Duration::from_secs(5)),
+        Some("bravo".to_string())
+    );
+
+    // Kill all nodes.
+    for (_, mut child) in children.drain() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // Restart all nodes from the same data directory (state files on disk).
+    let children = spawn_cluster(dir.path(), &peers);
+    let new_leader =
+        wait_for_leader(&peers, Duration::from_secs(5)).expect("leader re-elected after restart");
+
+    assert_eq!(
+        wait_for_get(&peers, "alpha", Duration::from_secs(5)),
+        Some("bravo".to_string()),
+        "persisted state should survive full cluster restart"
+    );
+
+    // New writes should still work.
+    let reply = send_client(
+        &peers[&new_leader],
+        ClientRequest::Set {
+            key: "charlie".to_string(),
+            value: "delta".to_string(),
+        },
+    )
+    .expect("set charlie after restart");
+    assert!(reply.success);
+    assert_eq!(
+        wait_for_get(&peers, "charlie", Duration::from_secs(5)),
+        Some("delta".to_string())
+    );
+
+    for (_, mut child) in children {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

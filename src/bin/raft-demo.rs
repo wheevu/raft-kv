@@ -1,4 +1,4 @@
-use raft_kv::{Cluster, Command, NodeId, Role};
+use raft_kv::{ClientRequest, Cluster, Command, NodeId, Role};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -72,9 +72,8 @@ fn sample_until(
 
 fn sample(cluster: &Cluster, time_ms: u64, note: Option<String>) -> Sample {
     let mut roles: Vec<_> = cluster
-        .nodes
-        .iter()
-        .map(|(&id, node)| (id, node.role))
+        .nodes()
+        .map(|(id, node)| (id, node.role()))
         .collect();
     roles.sort_by_key(|(id, _)| *id);
     Sample {
@@ -90,7 +89,7 @@ fn replication_table() -> String {
     let leader = cluster.leader().expect("leader");
     let reply = cluster.propose(
         leader,
-        Command::Set {
+        ClientRequest::Set {
             key: "foo".to_string(),
             value: "bar".to_string(),
         },
@@ -98,30 +97,29 @@ fn replication_table() -> String {
     assert!(reply.success);
     assert!(cluster.run_until(1200, |cluster| {
         cluster
-            .nodes
-            .values()
-            .all(|node| node.get("foo") == Some("bar"))
+            .nodes()
+            .all(|(_, node)| node.get("foo") == Some("bar"))
     }));
 
     let mut out = String::from(
         "| node | role | term | commit | applied | log | kv |\n|---:|---|---:|---:|---:|---|---|\n",
     );
-    let mut ids: Vec<_> = cluster.nodes.keys().copied().collect();
+    let mut ids: Vec<_> = cluster.node_ids().collect();
     ids.sort_unstable();
     for id in ids {
-        let node = &cluster.nodes[&id];
+        let node = cluster.node(id);
         let log = node
-            .log
+            .log()
             .iter()
             .map(|entry| command_label(&entry.command))
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
             "| {id} | {:?} | {} | {} | {} | [{}] | foo={} |\n",
-            node.role,
-            node.current_term,
-            node.commit_index,
-            node.last_applied,
+            node.role(),
+            node.current_term(),
+            node.commit_index(),
+            node.last_applied(),
             log,
             node.get("foo").unwrap_or("∅")
         ));
@@ -147,16 +145,15 @@ fn metrics_table() -> String {
     let leader = replication.leader().expect("leader");
     let _ = replication.propose(
         leader,
-        Command::Set {
+        ClientRequest::Set {
             key: "foo".to_string(),
             value: "bar".to_string(),
         },
     );
     let replication_ms = first_time_until(&mut replication, 1000, |cluster| {
         cluster
-            .nodes
-            .values()
-            .all(|node| node.get("foo") == Some("bar"))
+            .nodes()
+            .all(|(_, node)| node.get("foo") == Some("bar"))
     });
     let bench = benchmark_simulated_writes(3, 1_000);
 
@@ -176,7 +173,7 @@ fn benchmark_simulated_writes(cluster_size: usize, writes: usize) -> BenchResult
     for index in 0..writes {
         let reply = cluster.propose(
             leader,
-            Command::Set {
+            ClientRequest::Set {
                 key: format!("bench-{index}"),
                 value: index.to_string(),
             },
@@ -185,9 +182,8 @@ fn benchmark_simulated_writes(cluster_size: usize, writes: usize) -> BenchResult
     }
     assert!(cluster.run_until(20_000, |cluster| {
         cluster
-            .nodes
-            .values()
-            .all(|node| node.get(&format!("bench-{}", writes - 1)).is_some())
+            .nodes()
+            .all(|(_, node)| node.get(&format!("bench-{}", writes - 1)).is_some())
     }));
     let elapsed = started.elapsed();
     let writes_per_second = ((writes as f64) / elapsed.as_secs_f64()).round() as u64;
@@ -221,7 +217,6 @@ fn first_time_until(
 fn command_label(command: &Command) -> String {
     match command {
         Command::Noop => "noop".to_string(),
-        Command::Get { key } => format!("get {key}"),
         Command::Set { key, value } => format!("set {key}={value}"),
     }
 }
@@ -234,7 +229,7 @@ fn committed_cluster() -> Cluster {
         cluster
             .propose(
                 leader,
-                Command::Set {
+                ClientRequest::Set {
                     key: "foo".to_string(),
                     value: "bar".to_string()
                 }
@@ -245,7 +240,7 @@ fn committed_cluster() -> Cluster {
         cluster
             .propose(
                 leader,
-                Command::Set {
+                ClientRequest::Set {
                     key: "baz".to_string(),
                     value: "qux".to_string()
                 }
@@ -254,9 +249,8 @@ fn committed_cluster() -> Cluster {
     );
     assert!(cluster.run_until(1400, |cluster| {
         cluster
-            .nodes
-            .values()
-            .all(|node| node.get("baz") == Some("qux"))
+            .nodes()
+            .all(|(_, node)| node.get("baz") == Some("qux"))
     }));
     cluster
 }
@@ -264,8 +258,8 @@ fn committed_cluster() -> Cluster {
 fn render_dashboard_svg() -> String {
     let cluster = committed_cluster();
     let leader = cluster.leader().expect("leader");
-    let term = cluster.nodes[&leader].current_term;
-    let commit = cluster.nodes[&leader].commit_index;
+    let term = cluster.node(leader).current_term();
+    let commit = cluster.node(leader).commit_index();
     let mut svg = svg_shell(960, 430, "raft-kv · live cluster snapshot");
     svg.push_str(&format!(
         r##"<text x="36" y="74" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">term {term}</text>
@@ -273,12 +267,12 @@ fn render_dashboard_svg() -> String {
 <text x="360" y="74" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">commit index {commit}</text>
 "##
     ));
-    let mut ids: Vec<_> = cluster.nodes.keys().copied().collect();
+    let mut ids: Vec<_> = cluster.node_ids().collect();
     ids.sort_unstable();
     for (row, id) in ids.iter().enumerate() {
-        let node = &cluster.nodes[id];
+        let node = cluster.node(*id);
         let y = 112 + row as i32 * 54;
-        let (fill, label) = role_style(node.role);
+        let (fill, label) = role_style(node.role());
         svg.push_str(&format!(
             r##"<rect x="36" y="{}" width="888" height="40" rx="10" fill="#171a21" stroke="#30363d"/>
 <text x="58" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">node-{id}</text>
@@ -290,7 +284,7 @@ fn render_dashboard_svg() -> String {
 <text x="650" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">foo={}</text>
 <text x="770" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">baz={}</text>
 "##,
-            y, y + 25, y + 8, y + 24, y + 25, y + 25, y + 25, node.commit_index, y + 25, node.get("foo").unwrap_or("∅"), y + 25, node.get("baz").unwrap_or("∅")
+            y, y + 25, y + 8, y + 24, y + 25, y + 25, y + 25, node.commit_index(), y + 25, node.get("foo").unwrap_or("∅"), y + 25, node.get("baz").unwrap_or("∅")
         ));
     }
     finish_svg(svg)
@@ -347,12 +341,12 @@ fn render_failover_story_svg() -> String {
 fn render_log_ledger_svg() -> String {
     let cluster = committed_cluster();
     let mut svg = svg_shell(960, 410, "replicated log ledger");
-    let mut ids: Vec<_> = cluster.nodes.keys().copied().collect();
+    let mut ids: Vec<_> = cluster.node_ids().collect();
     ids.sort_unstable();
     for (row, id) in ids.iter().enumerate() {
-        let node = &cluster.nodes[id];
+        let node = cluster.node(*id);
         let y = 88 + row as i32 * 58;
-        let (fill, label) = role_style(node.role);
+        let (fill, label) = role_style(node.role());
         svg.push_str(&format!(
             r##"<text x="38" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">node-{id}</text>
 <rect x="120" y="{}" width="92" height="24" rx="12" fill="{fill}"/>
@@ -360,7 +354,7 @@ fn render_log_ledger_svg() -> String {
 "##,
             y + 22, y + 4, y + 20
         ));
-        for (col, entry) in node.log.iter().enumerate() {
+        for (col, entry) in node.log().iter().enumerate() {
             let x = 248 + col as i32 * 150;
             svg.push_str(&format!(
                 r##"<rect x="{x}" y="{y}" width="132" height="32" rx="8" fill="#21262d" stroke="#30363d"/>
