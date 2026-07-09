@@ -106,6 +106,13 @@ impl<S: StateMachine> Node<S> {
     pub fn role(&self) -> Role {
         self.role
     }
+    pub fn role_label(&self) -> &'static str {
+        match self.role {
+            Role::Follower => "follower",
+            Role::Candidate => "candidate",
+            Role::Leader => "leader",
+        }
+    }
     pub fn current_term(&self) -> Term {
         self.current_term
     }
@@ -130,6 +137,23 @@ impl<S: StateMachine> Node<S> {
 
     pub fn peers(&self) -> &[NodeId] {
         &self.peers
+    }
+
+    pub fn state_machine(&self) -> &S {
+        &self.state_machine
+    }
+
+    pub fn replication_lag_by_peer(&self) -> Vec<(NodeId, LogIndex)> {
+        if self.role != Role::Leader {
+            return Vec::new();
+        }
+        self.peers
+            .iter()
+            .map(|&peer| {
+                let matched = self.match_index.get(&peer).copied().unwrap_or(0);
+                (peer, self.commit_index.saturating_sub(matched))
+            })
+            .collect()
     }
 
     pub fn tick(&mut self, now_ms: u64) -> Vec<Message> {
@@ -193,7 +217,16 @@ impl<S: StateMachine> Node<S> {
                     leader_id: Some(self.id),
                     response: match self.state_machine.get(key) {
                         Ok(value) => value,
-                        Err(_) => return (ClientReply { success: false, leader_id: Some(self.id), response: None }, Vec::new()),
+                        Err(_) => {
+                            return (
+                                ClientReply {
+                                    success: false,
+                                    leader_id: Some(self.id),
+                                    response: None,
+                                },
+                                Vec::new(),
+                            );
+                        }
                     },
                 },
                 Vec::new(),
@@ -228,6 +261,7 @@ impl<S: StateMachine> Node<S> {
     fn start_election(&mut self, now_ms: u64) -> Vec<Message> {
         self.role = Role::Candidate;
         self.current_term += 1;
+        tracing::info!(node = self.id, term = self.current_term, "election started");
         self.voted_for = Some(self.id);
         self.leader_id = None;
         self.votes_granted = 1;
@@ -256,6 +290,12 @@ impl<S: StateMachine> Node<S> {
             };
         }
         if request.term > self.current_term {
+            tracing::info!(
+                node = self.id,
+                from_term = self.current_term,
+                to_term = request.term,
+                "term advanced by vote request"
+            );
             self.step_down(request.term, now_ms);
         }
         let can_vote = self.voted_for.is_none() || self.voted_for == Some(request.candidate_id);
@@ -266,6 +306,13 @@ impl<S: StateMachine> Node<S> {
         if vote_granted {
             self.voted_for = Some(request.candidate_id);
             self.reset_election_timer(now_ms);
+        } else {
+            tracing::info!(
+                node = self.id,
+                term = self.current_term,
+                candidate = request.candidate_id,
+                "vote rejected"
+            );
         }
         RequestVoteReply {
             term: self.current_term,
@@ -280,6 +327,12 @@ impl<S: StateMachine> Node<S> {
         now_ms: u64,
     ) -> Vec<Message> {
         if reply.term > self.current_term {
+            tracing::info!(
+                node = self.id,
+                from_term = self.current_term,
+                to_term = reply.term,
+                "term advanced by vote reply"
+            );
             self.step_down(reply.term, now_ms);
             return Vec::new();
         }
@@ -288,6 +341,12 @@ impl<S: StateMachine> Node<S> {
         }
         self.votes_granted += 1;
         if self.votes_granted >= self.majority() {
+            tracing::info!(
+                node = self.id,
+                term = self.current_term,
+                votes = self.votes_granted,
+                "election won"
+            );
             self.become_leader(now_ms)
         } else {
             Vec::new()
@@ -297,6 +356,7 @@ impl<S: StateMachine> Node<S> {
     fn become_leader(&mut self, now_ms: u64) -> Vec<Message> {
         self.role = Role::Leader;
         self.leader_id = Some(self.id);
+        tracing::info!(node = self.id, term = self.current_term, "became leader");
         self.last_heartbeat_at = now_ms;
         self.log.push(LogEntry {
             term: self.current_term,
@@ -315,6 +375,12 @@ impl<S: StateMachine> Node<S> {
 
     fn handle_append_entries(&mut self, request: AppendEntries, now_ms: u64) -> AppendEntriesReply {
         if request.term < self.current_term {
+            tracing::info!(
+                node = self.id,
+                term = self.current_term,
+                leader_term = request.term,
+                "append entries rejected: stale term"
+            );
             return AppendEntriesReply {
                 term: self.current_term,
                 success: false,
@@ -322,11 +388,23 @@ impl<S: StateMachine> Node<S> {
             };
         }
         if request.term > self.current_term || self.role != Role::Follower {
+            tracing::info!(
+                node = self.id,
+                from_term = self.current_term,
+                to_term = request.term,
+                "step down for append entries"
+            );
             self.step_down(request.term, now_ms);
         }
         self.leader_id = Some(request.leader_id);
         self.reset_election_timer(now_ms);
         if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
+            tracing::info!(
+                node = self.id,
+                term = self.current_term,
+                prev_log_index = request.prev_log_index,
+                "append entries rejected: log mismatch"
+            );
             return AppendEntriesReply {
                 term: self.current_term,
                 success: false,
@@ -347,6 +425,12 @@ impl<S: StateMachine> Node<S> {
             self.commit_index = request.leader_commit.min(self.last_log_index());
         }
         let _ = self.apply_committed();
+        tracing::info!(
+            node = self.id,
+            term = self.current_term,
+            match_index = index - 1,
+            "append entries accepted"
+        );
         AppendEntriesReply {
             term: self.current_term,
             success: true,
@@ -360,6 +444,12 @@ impl<S: StateMachine> Node<S> {
         reply: AppendEntriesReply,
     ) -> Vec<Message> {
         if reply.term > self.current_term {
+            tracing::info!(
+                node = self.id,
+                from_term = self.current_term,
+                to_term = reply.term,
+                "leader step down for append reply"
+            );
             self.step_down(reply.term, 0);
             return Vec::new();
         }
@@ -372,6 +462,12 @@ impl<S: StateMachine> Node<S> {
             self.advance_commit_index();
             Vec::new()
         } else {
+            tracing::info!(
+                node = self.id,
+                peer = from,
+                term = self.current_term,
+                "append entries rejected by follower"
+            );
             let next = self
                 .next_index
                 .get(&from)
@@ -407,6 +503,7 @@ impl<S: StateMachine> Node<S> {
     }
 
     fn advance_commit_index(&mut self) {
+        let previous = self.commit_index;
         for index in (self.commit_index + 1)..=self.last_log_index() {
             if self.term_at(index) == Some(self.current_term) {
                 let replicated = self
@@ -418,6 +515,14 @@ impl<S: StateMachine> Node<S> {
                     self.commit_index = index;
                 }
             }
+        }
+        if self.commit_index != previous {
+            tracing::info!(
+                node = self.id,
+                term = self.current_term,
+                commit_index = self.commit_index,
+                "commit index advanced"
+            );
         }
         let _ = self.apply_committed();
     }
@@ -433,6 +538,14 @@ impl<S: StateMachine> Node<S> {
     }
 
     fn step_down(&mut self, term: Term, now_ms: u64) {
+        if self.role == Role::Leader {
+            tracing::info!(
+                node = self.id,
+                from_term = self.current_term,
+                to_term = term,
+                "leader stepping down"
+            );
+        }
         self.role = Role::Follower;
         self.current_term = term;
         self.voted_for = None;

@@ -1,12 +1,13 @@
-use raft_kv::net::{WireMessage, read_frame, write_peer_frame, write_reply_frame};
-use raft_kv::storage::DurableState;
 use raft_kv::lsm::{LsmOptions, LsmTree};
+use raft_kv::net::{WireMessage, read_frame, write_peer_frame, write_reply_frame};
+use raft_kv::observability::{NodeMetrics, init_tracing};
+use raft_kv::storage::DurableState;
 use raft_kv::storage::{load_node_with_state_machine, save_node};
-use raft_kv::{Node, NodeId};
+use raft_kv::{ClientRequest, Node, NodeId, Role};
 use std::collections::HashMap;
 use std::env;
-use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -24,17 +25,26 @@ fn main() -> ExitCode {
 }
 
 fn run() -> io::Result<()> {
+    init_tracing();
     let config = Config::from_args(env::args().collect())?;
     let ids: Vec<_> = config.peers.keys().copied().collect();
     let peer_ids = ids.into_iter().filter(|&id| id != config.id).collect();
     let lsm = LsmTree::open(config.lsm_dir(), LsmOptions::default())?;
     let node = load_node_with_state_machine(&config.state_path, config.id, peer_ids, lsm)?;
-    let last_saved = DurableState::from_node(&node);
-    let shared = Arc::new(Mutex::new(Runtime {
-        node,
-        started: Instant::now(),
-        last_saved,
-    }));
+    let metrics = NodeMetrics::new(config.id)?;
+    let shared = Arc::new(Mutex::new(Runtime::new(node, metrics.clone())));
+    {
+        let mut runtime = shared.lock().expect("node mutex poisoned");
+        runtime.refresh_metrics();
+    }
+    if let Some(metrics_addr) = config.metrics_addr {
+        thread::spawn(move || serve_metrics(metrics_addr, metrics));
+    } else {
+        tracing::warn!(
+            node = config.id,
+            "metrics listener disabled: no metrics address"
+        );
+    }
     let ticker = Arc::clone(&shared);
     let tick_config = config.clone();
     thread::spawn(move || {
@@ -45,8 +55,9 @@ fn run() -> io::Result<()> {
                 let now = runtime.started.elapsed().as_millis() as u64;
                 let messages = runtime.node.tick(now);
                 if let Err(err) = runtime.persist_if_changed(&tick_config.state_path) {
-                    eprintln!("persist tick: {err}");
+                    tracing::error!(error = %err, "persist tick failed");
                 }
+                runtime.refresh_metrics();
                 messages
             };
             send_all(&tick_config.peers, messages);
@@ -58,13 +69,14 @@ fn run() -> io::Result<()> {
         .get(&config.id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing self address"))?;
     let listener = TcpListener::bind(bind)?;
+    tracing::info!(node = config.id, raft_addr = %bind, metrics_addr = ?config.metrics_addr, "raft node listening");
     for stream in listener.incoming() {
         let stream = stream?;
         let shared = Arc::clone(&shared);
         let request_config = config.clone();
         thread::spawn(move || {
             if let Err(err) = handle_connection(stream, shared, request_config) {
-                eprintln!("connection: {err}");
+                tracing::error!(error = %err, "connection failed");
             }
         });
     }
@@ -83,21 +95,33 @@ fn handle_connection(
                 let now = runtime.started.elapsed().as_millis() as u64;
                 let replies = runtime.node.handle_message(message.from, message.rpc, now);
                 if let Err(err) = runtime.persist_if_changed(&config.state_path) {
-                    eprintln!("persist peer message: {err}");
+                    tracing::error!(error = %err, "persist peer message failed");
                 }
+                runtime.refresh_metrics();
                 replies
             };
             send_all(&config.peers, replies);
         }
         WireMessage::ClientRequest(request) => {
+            let is_write = matches!(
+                request,
+                ClientRequest::Set { .. } | ClientRequest::Delete { .. }
+            );
+            let started = Instant::now();
             let (reply, messages) = {
                 let mut runtime = shared.lock().expect("node mutex poisoned");
                 let (mut reply, messages) = runtime.node.handle_client_request(request);
                 if let Err(err) = runtime.persist_if_changed(&config.state_path) {
-                    eprintln!("persist client write: {err}");
+                    tracing::error!(error = %err, "persist client write failed");
                     reply.success = false;
                     reply.response = None;
                 }
+                if is_write && reply.success {
+                    runtime
+                        .metrics
+                        .observe_write(started.elapsed().as_secs_f64());
+                }
+                runtime.refresh_metrics();
                 (reply, messages)
             };
             write_reply_frame(&mut stream, reply)?;
@@ -126,23 +150,86 @@ fn send_all(peers: &HashMap<NodeId, String>, messages: Vec<raft_kv::Message>) {
             Ok(mut stream) => {
                 for message in msgs {
                     if let Err(err) = write_peer_frame(&mut stream, message) {
-                        eprintln!("send to {addr}: {err}");
+                        tracing::warn!(addr, error = %err, "send failed");
                         break;
                     }
                 }
             }
-            Err(err) => eprintln!("connect to {addr}: {err}"),
+            Err(err) => tracing::warn!(addr, error = %err, "connect failed"),
         }
     }
+}
+
+fn serve_metrics(addr: SocketAddr, metrics: NodeMetrics) {
+    let listener = match TcpListener::bind(addr) {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::warn!(%addr, error = %err, "metrics listener disabled");
+            return;
+        }
+    };
+    tracing::info!(%addr, "metrics listener started");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(err) = handle_metrics_connection(&mut stream, &metrics) {
+                    tracing::warn!(error = %err, "metrics request failed");
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "metrics accept failed"),
+        }
+    }
+}
+
+fn handle_metrics_connection(stream: &mut TcpStream, metrics: &NodeMetrics) -> io::Result<()> {
+    let mut request = [0; 1024];
+    let read = stream.read(&mut request)?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let (status, body, content_type) = if request.starts_with("GET /metrics ") {
+        (
+            "200 OK",
+            metrics.render()?,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+    } else {
+        (
+            "404 Not Found",
+            "not found\n".to_string(),
+            "text/plain; charset=utf-8",
+        )
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    stream.flush()
 }
 
 struct Runtime {
     node: Node<LsmTree>,
     started: Instant,
     last_saved: DurableState,
+    metrics: NodeMetrics,
+    last_role: Role,
+    last_leader_id: Option<NodeId>,
 }
 
 impl Runtime {
+    fn new(node: Node<LsmTree>, metrics: NodeMetrics) -> Self {
+        let last_saved = DurableState::from_node(&node);
+        let last_role = node.role();
+        let last_leader_id = node.leader_id();
+        Self {
+            node,
+            started: Instant::now(),
+            last_saved,
+            metrics,
+            last_role,
+            last_leader_id,
+        }
+    }
+
     /// Persists if durable state differs from the last saved snapshot.
     /// Compares fields directly — no log allocation on the fast path.
     fn persist_if_changed(&mut self, path: &Path) -> io::Result<()> {
@@ -156,6 +243,34 @@ impl Runtime {
         }
         Ok(())
     }
+
+    fn refresh_metrics(&mut self) {
+        let role = self.node.role();
+        if role == Role::Candidate && self.last_role != Role::Candidate {
+            self.metrics.inc_elections();
+        }
+        if self.node.leader_id() != self.last_leader_id && self.node.leader_id().is_some() {
+            self.metrics.inc_leader_changes();
+        }
+        self.last_role = role;
+        self.last_leader_id = self.node.leader_id();
+
+        self.metrics.set_raft_state(
+            self.node.current_term(),
+            self.node.role_label(),
+            self.node.commit_index(),
+            self.node.last_applied(),
+        );
+        for (peer, lag) in self.node.replication_lag_by_peer() {
+            self.metrics.set_replication_lag(peer, lag);
+        }
+        self.metrics.set_lsm_state(
+            self.node.state_machine().memtable_size_bytes(),
+            self.node.state_machine().sstable_count(),
+        );
+        self.metrics
+            .set_lsm_compactions_total(self.node.state_machine().compactions_total());
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +278,7 @@ struct Config {
     id: NodeId,
     peers: HashMap<NodeId, String>,
     state_path: PathBuf,
+    metrics_addr: Option<SocketAddr>,
 }
 
 impl Config {
@@ -198,10 +314,31 @@ impl Config {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid peer id"))?;
             peers.insert(id, addr.to_string());
         }
+        let self_addr = peers
+            .get(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing self address"))?;
+        let metrics_addr = metrics_addr(self_addr)?;
         Ok(Self {
             id,
             peers,
             state_path,
+            metrics_addr,
         })
     }
+}
+
+fn metrics_addr(self_addr: &str) -> io::Result<Option<SocketAddr>> {
+    if let Ok(addr) = env::var("RAFT_KV_METRICS_ADDR") {
+        return addr.parse().map(Some).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid RAFT_KV_METRICS_ADDR")
+        });
+    }
+    let mut addr: SocketAddr = self_addr
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid self address"))?;
+    let Some(port) = addr.port().checked_add(1000) else {
+        return Ok(None);
+    };
+    addr.set_port(port);
+    Ok(Some(addr))
 }

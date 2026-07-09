@@ -2,6 +2,7 @@ pub mod cluster;
 pub mod lsm;
 pub mod net;
 pub mod node;
+pub mod observability;
 pub mod state_machine;
 pub mod storage;
 pub mod types;
@@ -144,9 +145,9 @@ mod tests {
             assert!(reply.success);
         }
         assert!(cluster.run_until(2500, |cluster| (0..10).all(|index| {
-            cluster.nodes().all(|(_, node)| {
-                node.get(&format!("k{index}")) == Some(format!("v{index}"))
-            })
+            cluster
+                .nodes()
+                .all(|(_, node)| node.get(&format!("k{index}")) == Some(format!("v{index}")))
         })));
     }
 

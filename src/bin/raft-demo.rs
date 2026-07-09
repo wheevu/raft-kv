@@ -30,6 +30,10 @@ fn run() -> io::Result<()> {
     fs::write(docs.join("failover-story.svg"), render_failover_story_svg())?;
     fs::write(docs.join("log-ledger.svg"), render_log_ledger_svg())?;
     fs::write(docs.join("lsm-storage.svg"), render_lsm_storage_svg())?;
+    fs::write(
+        docs.join("observability-loop.svg"),
+        render_observability_svg(),
+    )?;
     fs::write(docs.join("replication.md"), &replication)?;
     fs::write(docs.join("metrics.md"), &metrics)?;
     update_readme("README.md", &replication, &metrics)?;
@@ -423,6 +427,84 @@ fn render_lsm_storage_svg() -> String {
 "##,
     );
     finish_svg(svg)
+}
+
+fn render_observability_svg() -> String {
+    let mut svg = svg_shell(960, 390, "live observability loop");
+    svg.push_str(
+        r##"<defs><marker id="obs-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#58a6ff"/></marker></defs>
+"##,
+    );
+    for (node, y) in [("raft-node 0", 100), ("raft-node 1", 170), ("raft-node 2", 240)] {
+        svg.push_str(&format!(
+            r##"<rect x="48" y="{y}" width="150" height="52" rx="13" fill="#21262d" stroke="#30363d"/>
+<text x="66" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="700">{}</text>
+<text x="66" y="{}" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">/metrics + logs</text>
+"##,
+            y + 22,
+            escape(node),
+            y + 40
+        ));
+    }
+    let boxes = [
+        ("Prometheus", "scrapes every 2s", 336, 154, "#1f2a36"),
+        ("Grafana", "preloaded dashboard", 572, 154, "#2d2438"),
+    ];
+    for (title, subtitle, x, y, fill) in boxes {
+        svg.push_str(&format!(
+            r##"<rect x="{x}" y="{y}" width="170" height="82" rx="16" fill="{fill}" stroke="#30363d"/>
+<text x="{}" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="700">{}</text>
+<text x="{}" y="{}" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">{}</text>
+"##,
+            x + 20,
+            y + 34,
+            escape(title),
+            x + 20,
+            y + 58,
+            escape(subtitle)
+        ));
+    }
+    svg.push_str(
+        r##"<rect x="780" y="96" width="130" height="198" rx="16" fill="#11161d" stroke="#30363d"/>
+<text x="802" y="126" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="700">panels</text>
+<text x="802" y="154" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">role map</text>
+<text x="802" y="180" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">term</text>
+<text x="802" y="206" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">commit index</text>
+<text x="802" y="232" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">replication lag</text>
+<text x="802" y="258" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">compactions</text>
+"##,
+    );
+    for (x1, y1, x2, y2, label) in [
+        (198, 126, 336, 178, "/metrics"),
+        (198, 196, 336, 196, "/metrics"),
+        (198, 266, 336, 214, "/metrics"),
+        (506, 196, 572, 196, "PromQL"),
+        (742, 196, 780, 196, ""),
+    ] {
+        draw_obs_arrow(&mut svg, x1, y1, x2, y2, label);
+    }
+    svg.push_str(
+        r##"<path d="M198 306 C320 342 555 342 702 248" fill="none" stroke="#8b949e" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="52" y="342" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">logs stay local by default · set RAFT_KV_LOG=json for structured JSON</text>
+"##,
+    );
+    finish_svg(svg)
+}
+
+fn draw_obs_arrow(svg: &mut String, x1: i32, y1: i32, x2: i32, y2: i32, label: &str) {
+    svg.push_str(&format!(
+        r##"<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#58a6ff" stroke-width="2" marker-end="url(#obs-arrow)"/>
+"##
+    ));
+    if !label.is_empty() {
+        svg.push_str(&format!(
+            r##"<text x="{}" y="{}" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">{}</text>
+"##,
+            (x1 + x2) / 2 - 22,
+            (y1 + y2) / 2 - 8,
+            escape(label)
+        ));
+    }
 }
 
 fn draw_arrow(svg: &mut String, x1: i32, y1: i32, x2: i32, y2: i32, label: &str) {

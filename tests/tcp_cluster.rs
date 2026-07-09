@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
     let dir = tempfile::tempdir().unwrap();
     let peers = reserve_ports(3);
-    let mut children = spawn_cluster(dir.path(), &peers);
+    let metrics = reserve_ports(3);
+    let mut children = spawn_cluster(dir.path(), &peers, &metrics);
 
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
     let reply = send_client(
@@ -49,7 +50,7 @@ fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
         Some("qux".to_string())
     );
 
-    let restarted = spawn_node(dir.path(), leader, &peers);
+    let restarted = spawn_node(dir.path(), leader, &peers, &metrics);
     children.insert(leader, restarted);
     assert_eq!(
         wait_for_get(&peers, "foo", Duration::from_secs(5)),
@@ -73,15 +74,24 @@ fn reserve_ports(count: usize) -> HashMap<NodeId, String> {
         .collect()
 }
 
-fn spawn_cluster(dir: &Path, peers: &HashMap<NodeId, String>) -> HashMap<NodeId, Child> {
+fn spawn_cluster(
+    dir: &Path,
+    peers: &HashMap<NodeId, String>,
+    metrics: &HashMap<NodeId, String>,
+) -> HashMap<NodeId, Child> {
     peers
         .keys()
         .copied()
-        .map(|id| (id, spawn_node(dir, id, peers)))
+        .map(|id| (id, spawn_node(dir, id, peers, metrics)))
         .collect()
 }
 
-fn spawn_node(dir: &Path, id: NodeId, peers: &HashMap<NodeId, String>) -> Child {
+fn spawn_node(
+    dir: &Path,
+    id: NodeId,
+    peers: &HashMap<NodeId, String>,
+    metrics: &HashMap<NodeId, String>,
+) -> Child {
     let mut args = vec![
         id.to_string(),
         dir.join(format!("node-{id}.bin")).display().to_string(),
@@ -94,6 +104,7 @@ fn spawn_node(dir: &Path, id: NodeId, peers: &HashMap<NodeId, String>) -> Child 
     args.extend(peer_args);
     ProcessCommand::new(env!("CARGO_BIN_EXE_raft-node"))
         .args(args)
+        .env("RAFT_KV_METRICS_ADDR", &metrics[&id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -169,11 +180,22 @@ fn send_client(addr: &str, request: ClientRequest) -> io::Result<ClientReply> {
     }
 }
 
+fn get_metrics(addr: &str) -> io::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    io::Write::write_all(&mut stream, b"GET /metrics HTTP/1.1\r\nHost: node\r\n\r\n")?;
+    let mut response = String::new();
+    io::Read::read_to_string(&mut stream, &mut response)?;
+    Ok(response)
+}
+
 #[test]
 fn cluster_recovers_state_after_full_restart() {
     let dir = tempfile::tempdir().unwrap();
     let peers = reserve_ports(3);
-    let mut children = spawn_cluster(dir.path(), &peers);
+    let metrics = reserve_ports(3);
+    let mut children = spawn_cluster(dir.path(), &peers, &metrics);
 
     let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
     let reply = send_client(
@@ -198,7 +220,7 @@ fn cluster_recovers_state_after_full_restart() {
     }
 
     // Restart all nodes from the same data directory (state files on disk).
-    let children = spawn_cluster(dir.path(), &peers);
+    let children = spawn_cluster(dir.path(), &peers, &metrics);
     let new_leader =
         wait_for_leader(&peers, Duration::from_secs(5)).expect("leader re-elected after restart");
 
@@ -227,4 +249,57 @@ fn cluster_recovers_state_after_full_restart() {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+#[test]
+fn metrics_endpoint_exposes_raft_and_lsm_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let peers = reserve_ports(3);
+    let metrics = reserve_ports(3);
+    let children = spawn_cluster(dir.path(), &peers, &metrics);
+
+    let leader = wait_for_leader(&peers, Duration::from_secs(5)).expect("leader elected");
+    let reply = send_client(
+        &peers[&leader],
+        ClientRequest::Set {
+            key: "metrics".to_string(),
+            value: "visible".to_string(),
+        },
+    )
+    .expect("write through leader");
+    assert!(reply.success);
+
+    let body = wait_for_metrics(&metrics[&leader], Duration::from_secs(5)).expect("metrics body");
+    for name in [
+        "raft_term",
+        "raft_state",
+        "raft_commit_index",
+        "raft_last_applied",
+        "raft_writes_total",
+        "raft_write_latency_seconds",
+        "raft_replication_lag",
+        "lsm_memtable_size_bytes",
+        "lsm_sstable_count",
+        "lsm_compactions_total",
+    ] {
+        assert!(body.contains(name), "missing {name}\n{body}");
+    }
+
+    for (_, mut child) in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn wait_for_metrics(addr: &str, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(response) = get_metrics(addr)
+            && response.starts_with("HTTP/1.1 200 OK")
+        {
+            return Some(response);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
 }

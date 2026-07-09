@@ -91,7 +91,8 @@ impl BloomFilter {
     fn bits_for<'a>(&'a self, key: &'a str) -> impl Iterator<Item = usize> + 'a {
         let h1 = hash_with_seed(key.as_bytes(), 0xcbf2_9ce4_8422_2325);
         let h2 = hash_with_seed(key.as_bytes(), 0x9e37_79b9_7f4a_7c15) | 1;
-        (0..BLOOM_HASHES).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)) as usize % self.bit_len)
+        (0..BLOOM_HASHES)
+            .map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)) as usize % self.bit_len)
     }
 }
 
@@ -115,6 +116,7 @@ pub struct LsmTree {
     options: LsmOptions,
     last_applied: LogIndex,
     disk_reads: usize,
+    compactions_total: usize,
 }
 
 impl LsmTree {
@@ -124,7 +126,11 @@ impl LsmTree {
         let wal_path = dir.join("wal.log");
         let mut tables = load_tables(&dir)?;
         tables.sort_by_key(|table| std::cmp::Reverse(table.id));
-        let mut last_applied = tables.iter().map(|table| table.max_index).max().unwrap_or(0);
+        let mut last_applied = tables
+            .iter()
+            .map(|table| table.max_index)
+            .max()
+            .unwrap_or(0);
         let mut memtable = BTreeMap::new();
         let mut memtable_bytes = 0;
         if wal_path.exists() {
@@ -154,6 +160,7 @@ impl LsmTree {
             options,
             last_applied,
             disk_reads: 0,
+            compactions_total: 0,
         })
     }
 
@@ -186,6 +193,8 @@ impl LsmTree {
         if self.tables.len() < 2 {
             return Ok(());
         }
+        let input_tables = self.tables.len();
+        tracing::info!(input_tables, "lsm compaction started");
         let old_tables = std::mem::take(&mut self.tables);
         let mut merged: BTreeMap<String, DataEntry> = BTreeMap::new();
         for table in &old_tables {
@@ -200,7 +209,11 @@ impl LsmTree {
         let new_table = if entries.is_empty() {
             None
         } else {
-            Some(write_table(&self.dir, self.next_table_id_from(&old_tables), &entries)?)
+            Some(write_table(
+                &self.dir,
+                self.next_table_id_from(&old_tables),
+                &entries,
+            )?)
         };
         if let Some(table) = new_table {
             self.tables.push(table);
@@ -210,6 +223,12 @@ impl LsmTree {
             let _ = fs::remove_file(table.path);
         }
         self.tables.sort_by_key(|table| std::cmp::Reverse(table.id));
+        self.compactions_total += 1;
+        tracing::info!(
+            input_tables,
+            output_tables = self.tables.len(),
+            "lsm compaction finished"
+        );
         sync_dir(&self.dir);
         Ok(())
     }
@@ -220,6 +239,14 @@ impl LsmTree {
 
     pub fn disk_read_count(&self) -> usize {
         self.disk_reads
+    }
+
+    pub fn memtable_size_bytes(&self) -> usize {
+        self.memtable_bytes
+    }
+
+    pub fn compactions_total(&self) -> usize {
+        self.compactions_total
     }
 
     #[cfg(test)]
@@ -237,12 +264,18 @@ impl LsmTree {
             return Ok(());
         }
         if index != self.last_applied + 1 {
-            return Err(io::Error::new(ErrorKind::InvalidInput, "state machine apply index gap"));
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "state machine apply index gap",
+            ));
         }
         // The Raft log index is part of the storage commit record. This lets recovery
         // distinguish "already applied" from "must replay" without relying on commands
         // being idempotent.
-        self.append_wal(WalFrame { index, record: record.clone() })?;
+        self.append_wal(WalFrame {
+            index,
+            record: record.clone(),
+        })?;
         if let Some(record) = record {
             self.memtable_bytes += record_size(&record);
             self.memtable.insert(record.key, (record.value, index));
@@ -287,7 +320,13 @@ impl LsmTree {
     }
 
     fn next_table_id_from(&self, tables: &[Sstable]) -> u64 {
-        tables.iter().map(|table| table.id).max().unwrap_or(0).max(self.next_table_id()) + 1
+        tables
+            .iter()
+            .map(|table| table.id)
+            .max()
+            .unwrap_or(0)
+            .max(self.next_table_id())
+            + 1
     }
 
     fn reset_wal(&mut self) -> io::Result<()> {
@@ -331,26 +370,46 @@ impl LsmTree {
 fn record_from_command(command: &Command) -> Option<Record> {
     match command {
         Command::Noop => None,
-        Command::Set { key, value } => Some(Record { key: key.clone(), value: Some(value.clone()) }),
-        Command::Delete { key } => Some(Record { key: key.clone(), value: None }),
+        Command::Set { key, value } => Some(Record {
+            key: key.clone(),
+            value: Some(value.clone()),
+        }),
+        Command::Delete { key } => Some(Record {
+            key: key.clone(),
+            value: None,
+        }),
     }
 }
 
 fn write_table(dir: &Path, id: u64, entries: &[DataEntry]) -> io::Result<Sstable> {
     let path = dir.join(format!("sst-{id:020}.sst"));
     let tmp = dir.join(format!(".sst-{id:020}.tmp"));
-    let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)?;
     let mut index = Vec::new();
     for (pos, entry) in entries.iter().enumerate() {
         let offset = file.stream_position()?;
         if pos % INDEX_STRIDE == 0 {
-            index.push(IndexEntry { key: entry.record.key.clone(), offset });
+            index.push(IndexEntry {
+                key: entry.record.key.clone(),
+                offset,
+            });
         }
         write_frame(&mut file, entry)?;
     }
     let max_index = entries.iter().map(|entry| entry.index).max().unwrap_or(0);
-    let bloom = BloomFilter::new(entries.iter().map(|entry| entry.record.key.clone()), entries.len());
-    let footer = SstableFooter { index: index.clone(), bloom: bloom.clone(), max_index };
+    let bloom = BloomFilter::new(
+        entries.iter().map(|entry| entry.record.key.clone()),
+        entries.len(),
+    );
+    let footer = SstableFooter {
+        index: index.clone(),
+        bloom: bloom.clone(),
+        max_index,
+    };
     let footer_bytes = bincode::serialize(&footer).map_err(io::Error::other)?;
     file.write_all(&footer_bytes)?;
     file.write_all(&(footer_bytes.len() as u64).to_be_bytes())?;
@@ -358,7 +417,13 @@ fn write_table(dir: &Path, id: u64, entries: &[DataEntry]) -> io::Result<Sstable
     file.sync_all()?;
     fs::rename(&tmp, &path)?;
     sync_dir(dir);
-    Ok(Sstable { id, path, index, bloom, max_index })
+    Ok(Sstable {
+        id,
+        path,
+        index,
+        bloom,
+        max_index,
+    })
 }
 
 fn load_tables(dir: &Path) -> io::Result<Vec<Sstable>> {
@@ -369,11 +434,22 @@ fn load_tables(dir: &Path) -> io::Result<Vec<Sstable>> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("sst") {
             continue;
         }
-        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()).and_then(|stem| stem.strip_prefix("sst-")).and_then(|id| id.parse().ok()) else {
+        let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_prefix("sst-"))
+            .and_then(|id| id.parse().ok())
+        else {
             continue;
         };
         let footer = read_footer(&path)?;
-        tables.push(Sstable { id, path, index: footer.index, bloom: footer.bloom, max_index: footer.max_index });
+        tables.push(Sstable {
+            id,
+            path,
+            index: footer.index,
+            bloom: footer.bloom,
+            max_index: footer.max_index,
+        });
     }
     Ok(tables)
 }
@@ -474,7 +550,8 @@ fn read_wal_frames_truncating(path: &Path) -> io::Result<Vec<WalFrame>> {
 
 fn write_frame<T: Serialize>(file: &mut File, value: &T) -> io::Result<()> {
     let bytes = bincode::serialize(value).map_err(io::Error::other)?;
-    let len = u32::try_from(bytes.len()).map_err(|_| io::Error::new(ErrorKind::InvalidInput, "frame too large"))?;
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "frame too large"))?;
     file.write_all(&len.to_be_bytes())?;
     file.write_all(&bytes)
 }
@@ -494,7 +571,9 @@ fn read_frame<T: for<'de> Deserialize<'de>>(file: &mut File) -> io::Result<Optio
     let len = u32::from_be_bytes(len) as usize;
     let mut bytes = vec![0; len];
     file.read_exact(&mut bytes)?;
-    bincode::deserialize(&bytes).map(Some).map_err(|err| io::Error::new(ErrorKind::InvalidData, err))
+    bincode::deserialize(&bytes)
+        .map(Some)
+        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))
 }
 
 fn record_size(record: &Record) -> usize {
@@ -521,14 +600,24 @@ mod tests {
     use super::*;
 
     fn opts() -> LsmOptions {
-        LsmOptions { memtable_bytes: 64, compaction_threshold: 10 }
+        LsmOptions {
+            memtable_bytes: 64,
+            compaction_threshold: 10,
+        }
     }
 
     #[test]
     fn memtable_flush_triggers_at_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(dir.path(), opts()).unwrap();
-        tree.apply(1, &Command::Set { key: "a".into(), value: "x".repeat(80) }).unwrap();
+        tree.apply(
+            1,
+            &Command::Set {
+                key: "a".into(),
+                value: "x".repeat(80),
+            },
+        )
+        .unwrap();
         assert_eq!(tree.sstable_count(), 1);
         assert_eq!(tree.get_mut("a").unwrap(), Some("x".repeat(80)));
     }
@@ -538,7 +627,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut tree = LsmTree::open(dir.path(), LsmOptions::default()).unwrap();
-            tree.apply(1, &Command::Set { key: "k".into(), value: "v".into() }).unwrap();
+            tree.apply(
+                1,
+                &Command::Set {
+                    key: "k".into(),
+                    value: "v".into(),
+                },
+            )
+            .unwrap();
         }
         let mut tree = LsmTree::open(dir.path(), LsmOptions::default()).unwrap();
         assert_eq!(tree.last_applied(), 1);
@@ -550,7 +646,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut tree = LsmTree::open(dir.path(), LsmOptions::default()).unwrap();
-            tree.append_wal_only_for_test(1, &Command::Set { key: "k".into(), value: "v".into() }).unwrap();
+            tree.append_wal_only_for_test(
+                1,
+                &Command::Set {
+                    key: "k".into(),
+                    value: "v".into(),
+                },
+            )
+            .unwrap();
         }
         let mut tree = LsmTree::open(dir.path(), LsmOptions::default()).unwrap();
         assert_eq!(tree.get_mut("k").unwrap(), Some("v".into()));
@@ -561,9 +664,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut tree = LsmTree::open(dir.path(), LsmOptions::default()).unwrap();
-            tree.apply(1, &Command::Set { key: "ok".into(), value: "yes".into() }).unwrap();
+            tree.apply(
+                1,
+                &Command::Set {
+                    key: "ok".into(),
+                    value: "yes".into(),
+                },
+            )
+            .unwrap();
         }
-        let mut wal = OpenOptions::new().append(true).open(dir.path().join("wal.log")).unwrap();
+        let mut wal = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("wal.log"))
+            .unwrap();
         wal.write_all(&99_u32.to_be_bytes()).unwrap();
         wal.write_all(b"partial").unwrap();
         wal.sync_all().unwrap();
@@ -575,7 +688,14 @@ mod tests {
     fn bloom_filter_skips_unnecessary_disk_reads() {
         let dir = tempfile::tempdir().unwrap();
         let mut tree = LsmTree::open(dir.path(), opts()).unwrap();
-        tree.apply(1, &Command::Set { key: "present".into(), value: "v".repeat(80) }).unwrap();
+        tree.apply(
+            1,
+            &Command::Set {
+                key: "present".into(),
+                value: "v".repeat(80),
+            },
+        )
+        .unwrap();
         let before = tree.disk_read_count();
         assert_eq!(tree.get_mut("definitely-missing").unwrap(), None);
         assert_eq!(tree.disk_read_count(), before);
@@ -584,9 +704,24 @@ mod tests {
     #[test]
     fn compaction_merges_and_removes_tombstones() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tree = LsmTree::open(dir.path(), LsmOptions { memtable_bytes: 1, compaction_threshold: 10 }).unwrap();
-        tree.apply(1, &Command::Set { key: "gone".into(), value: "v".into() }).unwrap();
-        tree.apply(2, &Command::Delete { key: "gone".into() }).unwrap();
+        let mut tree = LsmTree::open(
+            dir.path(),
+            LsmOptions {
+                memtable_bytes: 1,
+                compaction_threshold: 10,
+            },
+        )
+        .unwrap();
+        tree.apply(
+            1,
+            &Command::Set {
+                key: "gone".into(),
+                value: "v".into(),
+            },
+        )
+        .unwrap();
+        tree.apply(2, &Command::Delete { key: "gone".into() })
+            .unwrap();
         tree.compact().unwrap();
         assert_eq!(tree.get_mut("gone").unwrap(), None);
         assert_eq!(tree.sstable_count(), 0);
@@ -597,10 +732,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let old_paths;
         {
-            let mut tree = LsmTree::open(dir.path(), LsmOptions { memtable_bytes: 1, compaction_threshold: 10 }).unwrap();
-            tree.apply(1, &Command::Set { key: "k".into(), value: "old".into() }).unwrap();
-            tree.apply(2, &Command::Set { key: "k".into(), value: "new".into() }).unwrap();
-            old_paths = tree.tables.iter().map(|t| t.path.clone()).collect::<Vec<_>>();
+            let mut tree = LsmTree::open(
+                dir.path(),
+                LsmOptions {
+                    memtable_bytes: 1,
+                    compaction_threshold: 10,
+                },
+            )
+            .unwrap();
+            tree.apply(
+                1,
+                &Command::Set {
+                    key: "k".into(),
+                    value: "old".into(),
+                },
+            )
+            .unwrap();
+            tree.apply(
+                2,
+                &Command::Set {
+                    key: "k".into(),
+                    value: "new".into(),
+                },
+            )
+            .unwrap();
+            old_paths = tree
+                .tables
+                .iter()
+                .map(|t| t.path.clone())
+                .collect::<Vec<_>>();
             let mut merged = BTreeMap::new();
             for table in &tree.tables {
                 for entry in read_all_entries(&table.path).unwrap() {
