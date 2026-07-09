@@ -435,7 +435,11 @@ fn render_observability_svg() -> String {
         r##"<defs><marker id="obs-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#58a6ff"/></marker></defs>
 "##,
     );
-    for (node, y) in [("raft-node 0", 100), ("raft-node 1", 170), ("raft-node 2", 240)] {
+    for (node, y) in [
+        ("raft-node 0", 100),
+        ("raft-node 1", 170),
+        ("raft-node 2", 240),
+    ] {
         svg.push_str(&format!(
             r##"<rect x="48" y="{y}" width="150" height="52" rx="13" fill="#21262d" stroke="#30363d"/>
 <text x="66" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" font-weight="700">{}</text>
