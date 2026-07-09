@@ -1,12 +1,15 @@
 pub mod cluster;
+pub mod lsm;
 pub mod net;
 pub mod node;
+pub mod state_machine;
 pub mod storage;
 pub mod types;
 
 // Re-export public API from sub-modules.
 pub use cluster::Cluster;
 pub use node::Node;
+pub use state_machine::{MemoryStateMachine, StateMachine};
 pub use types::{
     AppendEntries, AppendEntriesReply, ClientReply, ClientRequest, Command, LogEntry, LogIndex,
     Message, NodeId, RequestVote, RequestVoteReply, Role, Rpc, Term,
@@ -59,7 +62,7 @@ mod tests {
         assert!(cluster.run_until(1000, |cluster| {
             cluster
                 .nodes()
-                .all(|(_, node)| node.get("foo") == Some("bar"))
+                .all(|(_, node)| node.get("foo") == Some("bar".to_string()))
         }));
     }
 
@@ -86,7 +89,7 @@ mod tests {
             cluster
                 .nodes()
                 .filter(|(id, _)| *id != old_leader)
-                .all(|(_, node)| node.get("foo") == Some("bar"))
+                .all(|(_, node)| node.get("foo") == Some("bar".to_string()))
         }));
     }
 
@@ -142,7 +145,7 @@ mod tests {
         }
         assert!(cluster.run_until(2500, |cluster| (0..10).all(|index| {
             cluster.nodes().all(|(_, node)| {
-                node.get(&format!("k{index}")) == Some(format!("v{index}").as_str())
+                node.get(&format!("k{index}")) == Some(format!("v{index}"))
             })
         })));
     }
@@ -168,14 +171,14 @@ mod tests {
             cluster
                 .nodes()
                 .filter(|(id, _)| *id != isolated)
-                .all(|(_, node)| node.get("after_partition") == Some("ok"))
+                .all(|(_, node)| node.get("after_partition") == Some("ok".to_string()))
         }));
         assert!(cluster.node(isolated).get("after_partition").is_none());
 
         cluster.heal();
         assert!(cluster.run_until(
             3000,
-            |cluster| cluster.node(isolated).get("after_partition") == Some("ok")
+            |cluster| cluster.node(isolated).get("after_partition") == Some("ok".to_string())
         ));
     }
 

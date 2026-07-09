@@ -1,3 +1,4 @@
+use crate::state_machine::{MemoryStateMachine, StateMachine};
 use crate::types::*;
 use std::collections::HashMap;
 
@@ -6,7 +7,7 @@ const ELECTION_MIN_MS: u64 = 150;
 const ELECTION_SPAN_MS: u64 = 151;
 
 #[derive(Clone, Debug)]
-pub struct Node {
+pub struct Node<S: StateMachine = MemoryStateMachine> {
     id: NodeId,
     peers: Vec<NodeId>,
     role: Role,
@@ -15,7 +16,7 @@ pub struct Node {
     log: Vec<LogEntry>,
     commit_index: LogIndex,
     last_applied: LogIndex,
-    state_machine: HashMap<String, String>,
+    state_machine: S,
     leader_id: Option<NodeId>,
     election_deadline: u64,
     last_heartbeat_at: u64,
@@ -28,8 +29,33 @@ pub struct Node {
     term_start_index: LogIndex,
 }
 
-impl Node {
+impl Node<MemoryStateMachine> {
     pub fn new(id: NodeId, peers: Vec<NodeId>) -> Self {
+        Self::new_with_state_machine(id, peers, MemoryStateMachine::new())
+    }
+
+    pub fn from_parts(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        current_term: Term,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry>,
+        commit_index: LogIndex,
+    ) -> Self {
+        Self::from_parts_with_state_machine(
+            id,
+            peers,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            MemoryStateMachine::new(),
+        )
+    }
+}
+
+impl<S: StateMachine> Node<S> {
+    pub fn new_with_state_machine(id: NodeId, peers: Vec<NodeId>, state_machine: S) -> Self {
         let mut node = Self {
             id,
             peers,
@@ -38,8 +64,8 @@ impl Node {
             voted_for: None,
             log: Vec::new(),
             commit_index: 0,
-            last_applied: 0,
-            state_machine: HashMap::new(),
+            last_applied: state_machine.last_applied(),
+            state_machine,
             leader_id: None,
             election_deadline: 0,
             last_heartbeat_at: 0,
@@ -53,20 +79,21 @@ impl Node {
         node
     }
 
-    pub fn from_parts(
+    pub fn from_parts_with_state_machine(
         id: NodeId,
         peers: Vec<NodeId>,
         current_term: Term,
         voted_for: Option<NodeId>,
         log: Vec<LogEntry>,
         commit_index: LogIndex,
+        state_machine: S,
     ) -> Self {
-        let mut node = Self::new(id, peers);
+        let mut node = Self::new_with_state_machine(id, peers, state_machine);
         node.current_term = current_term;
         node.voted_for = voted_for;
         node.log = log;
         node.commit_index = commit_index.min(node.log.len());
-        node.apply_committed();
+        let _ = node.apply_committed();
         node
     }
 
@@ -97,8 +124,8 @@ impl Node {
     pub fn can_serve_reads(&self) -> bool {
         self.commit_index >= self.term_start_index
     }
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.state_machine.get(key).map(String::as_str)
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.state_machine.get(key).ok().flatten()
     }
 
     pub fn peers(&self) -> &[NodeId] {
@@ -164,17 +191,22 @@ impl Node {
                 ClientReply {
                     success: true,
                     leader_id: Some(self.id),
-                    response: self.state_machine.get(key).cloned(),
+                    response: match self.state_machine.get(key) {
+                        Ok(value) => value,
+                        Err(_) => return (ClientReply { success: false, leader_id: Some(self.id), response: None }, Vec::new()),
+                    },
                 },
                 Vec::new(),
             );
         }
-        let ClientRequest::Set { key, value } = request else {
-            unreachable!();
+        let command = match request {
+            ClientRequest::Set { key, value } => Command::Set { key, value },
+            ClientRequest::Delete { key } => Command::Delete { key },
+            ClientRequest::Get { .. } => unreachable!(),
         };
         self.log.push(LogEntry {
             term: self.current_term,
-            command: Command::Set { key, value },
+            command,
         });
         let last = self.last_log_index();
         self.match_index.insert(self.id, last);
@@ -314,7 +346,7 @@ impl Node {
         if request.leader_commit > self.commit_index {
             self.commit_index = request.leader_commit.min(self.last_log_index());
         }
-        self.apply_committed();
+        let _ = self.apply_committed();
         AppendEntriesReply {
             term: self.current_term,
             success: true,
@@ -387,19 +419,17 @@ impl Node {
                 }
             }
         }
-        self.apply_committed();
+        let _ = self.apply_committed();
     }
 
-    fn apply_committed(&mut self) {
+    fn apply_committed(&mut self) -> std::io::Result<()> {
         while self.last_applied < self.commit_index {
-            self.last_applied += 1;
-            match &self.log[self.last_applied - 1].command {
-                Command::Noop => {}
-                Command::Set { key, value } => {
-                    self.state_machine.insert(key.clone(), value.clone());
-                }
-            }
+            let next = self.last_applied + 1;
+            self.state_machine
+                .apply(next, &self.log[next - 1].command)?;
+            self.last_applied = next;
         }
+        Ok(())
     }
 
     fn step_down(&mut self, term: Term, now_ms: u64) {

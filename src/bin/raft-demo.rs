@@ -29,6 +29,7 @@ fn run() -> io::Result<()> {
     fs::write(docs.join("cluster-dashboard.svg"), render_dashboard_svg())?;
     fs::write(docs.join("failover-story.svg"), render_failover_story_svg())?;
     fs::write(docs.join("log-ledger.svg"), render_log_ledger_svg())?;
+    fs::write(docs.join("lsm-storage.svg"), render_lsm_storage_svg())?;
     fs::write(docs.join("replication.md"), &replication)?;
     fs::write(docs.join("metrics.md"), &metrics)?;
     update_readme("README.md", &replication, &metrics)?;
@@ -98,7 +99,7 @@ fn replication_table() -> String {
     assert!(cluster.run_until(1200, |cluster| {
         cluster
             .nodes()
-            .all(|(_, node)| node.get("foo") == Some("bar"))
+            .all(|(_, node)| node.get("foo") == Some("bar".to_string()))
     }));
 
     let mut out = String::from(
@@ -121,7 +122,7 @@ fn replication_table() -> String {
             node.commit_index(),
             node.last_applied(),
             log,
-            node.get("foo").unwrap_or("∅")
+            node.get("foo").unwrap_or("∅".to_string())
         ));
     }
     out
@@ -153,7 +154,7 @@ fn metrics_table() -> String {
     let replication_ms = first_time_until(&mut replication, 1000, |cluster| {
         cluster
             .nodes()
-            .all(|(_, node)| node.get("foo") == Some("bar"))
+            .all(|(_, node)| node.get("foo") == Some("bar".to_string()))
     });
     let bench = benchmark_simulated_writes(3, 1_000);
 
@@ -218,6 +219,7 @@ fn command_label(command: &Command) -> String {
     match command {
         Command::Noop => "noop".to_string(),
         Command::Set { key, value } => format!("set {key}={value}"),
+        Command::Delete { key } => format!("delete {key}"),
     }
 }
 
@@ -250,7 +252,7 @@ fn committed_cluster() -> Cluster {
     assert!(cluster.run_until(1400, |cluster| {
         cluster
             .nodes()
-            .all(|(_, node)| node.get("baz") == Some("qux"))
+            .all(|(_, node)| node.get("baz") == Some("qux".to_string()))
     }));
     cluster
 }
@@ -284,7 +286,7 @@ fn render_dashboard_svg() -> String {
 <text x="650" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">foo={}</text>
 <text x="770" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="13">baz={}</text>
 "##,
-            y, y + 25, y + 8, y + 24, y + 25, y + 25, y + 25, node.commit_index(), y + 25, node.get("foo").unwrap_or("∅"), y + 25, node.get("baz").unwrap_or("∅")
+            y, y + 25, y + 8, y + 24, y + 25, y + 25, y + 25, node.commit_index(), y + 25, node.get("foo").unwrap_or("∅".to_string()), y + 25, node.get("baz").unwrap_or("∅".to_string())
         ));
     }
     finish_svg(svg)
@@ -372,6 +374,71 @@ fn render_log_ledger_svg() -> String {
         ));
     }
     finish_svg(svg)
+}
+
+fn render_lsm_storage_svg() -> String {
+    let mut svg = svg_shell(960, 430, "LSM storage path");
+    svg.push_str(
+        r##"<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#58a6ff"/></marker></defs>
+"##,
+    );
+    let boxes = [
+        ("Raft commit", "ordered command", 48, 98, "#21262d"),
+        ("WAL fsync", "durable first", 250, 98, "#1f2a36"),
+        ("memtable", "BTreeMap", 452, 98, "#173322"),
+        ("SSTable", "sorted file", 654, 98, "#2d2438"),
+        ("get key", "point read", 48, 264, "#21262d"),
+        ("bloom filter", "skip misses", 452, 264, "#2d2a1f"),
+        ("sparse index", "seek nearby", 654, 264, "#2d2a1f"),
+    ];
+    for (title, subtitle, x, y, fill) in boxes {
+        svg.push_str(&format!(
+            r##"<rect x="{x}" y="{y}" width="150" height="76" rx="14" fill="{fill}" stroke="#30363d"/>
+<text x="{}" y="{}" fill="#e6e1d9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="700">{}</text>
+<text x="{}" y="{}" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">{}</text>
+"##,
+            x + 18,
+            y + 32,
+            escape(title),
+            x + 18,
+            y + 56,
+            escape(subtitle)
+        ));
+    }
+    for (x1, y1, x2, y2, label) in [
+        (198, 136, 250, 136, "append"),
+        (400, 136, 452, 136, "apply"),
+        (602, 136, 654, 136, "flush"),
+        (198, 302, 452, 302, "miss"),
+        (602, 302, 654, 302, "maybe"),
+        (727, 264, 727, 174, "read file"),
+        (527, 264, 527, 174, ""),
+    ] {
+        draw_arrow(&mut svg, x1, y1, x2, y2, label);
+    }
+    svg.push_str(
+        r##"<path d="M123 264 C123 220 500 220 527 174" fill="none" stroke="#3fb950" stroke-width="2" stroke-dasharray="6 6"/>
+<path d="M527 264 C527 226 692 220 727 174" fill="none" stroke="#d29922" stroke-width="2" stroke-dasharray="6 6"/>
+<text x="52" y="388" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">writes flow left to right · reads start at memtable, then bloom/index/SSTable</text>
+"##,
+    );
+    finish_svg(svg)
+}
+
+fn draw_arrow(svg: &mut String, x1: i32, y1: i32, x2: i32, y2: i32, label: &str) {
+    svg.push_str(&format!(
+        r##"<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#58a6ff" stroke-width="2" marker-end="url(#arrow)"/>
+"##
+    ));
+    if !label.is_empty() {
+        svg.push_str(&format!(
+            r##"<text x="{}" y="{}" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">{}</text>
+"##,
+            (x1 + x2) / 2 - 18,
+            (y1 + y2) / 2 - 8,
+            escape(label)
+        ));
+    }
 }
 
 fn svg_shell(width: i32, height: i32, title: &str) -> String {

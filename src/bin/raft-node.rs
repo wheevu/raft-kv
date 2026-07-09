@@ -1,6 +1,7 @@
 use raft_kv::net::{WireMessage, read_frame, write_peer_frame, write_reply_frame};
 use raft_kv::storage::DurableState;
-use raft_kv::storage::{load_node, save_node};
+use raft_kv::lsm::{LsmOptions, LsmTree};
+use raft_kv::storage::{load_node_with_state_machine, save_node};
 use raft_kv::{Node, NodeId};
 use std::collections::HashMap;
 use std::env;
@@ -26,7 +27,8 @@ fn run() -> io::Result<()> {
     let config = Config::from_args(env::args().collect())?;
     let ids: Vec<_> = config.peers.keys().copied().collect();
     let peer_ids = ids.into_iter().filter(|&id| id != config.id).collect();
-    let node = load_node(&config.state_path, config.id, peer_ids)?;
+    let lsm = LsmTree::open(config.lsm_dir(), LsmOptions::default())?;
+    let node = load_node_with_state_machine(&config.state_path, config.id, peer_ids, lsm)?;
     let last_saved = DurableState::from_node(&node);
     let shared = Arc::new(Mutex::new(Runtime {
         node,
@@ -135,7 +137,7 @@ fn send_all(peers: &HashMap<NodeId, String>, messages: Vec<raft_kv::Message>) {
 }
 
 struct Runtime {
-    node: Node,
+    node: Node<LsmTree>,
     started: Instant,
     last_saved: DurableState,
 }
@@ -164,6 +166,17 @@ struct Config {
 }
 
 impl Config {
+    fn lsm_dir(&self) -> PathBuf {
+        let mut path = self.state_path.clone();
+        let name = self
+            .state_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("node.bin");
+        path.set_file_name(format!("{name}.lsm"));
+        path
+    }
+
     fn from_args(args: Vec<String>) -> io::Result<Self> {
         if args.len() < 5 {
             return Err(io::Error::new(

@@ -15,6 +15,7 @@ pub enum Role {
 pub enum Command {
     Noop,
     Set { key: String, value: String },
+    Delete { key: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,6 +59,7 @@ pub struct AppendEntriesReply {
 pub enum ClientRequest {
     Get { key: String },
     Set { key: String, value: String },
+    Delete { key: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

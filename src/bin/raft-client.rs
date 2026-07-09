@@ -21,6 +21,7 @@ fn run() -> io::Result<()> {
     if args.len() < 3 {
         eprintln!("usage: raft-client <peer>... set <key> <value>");
         eprintln!("       raft-client <peer>... get <key>");
+        eprintln!("       raft-client <peer>... delete <key>");
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not enough args",
@@ -29,11 +30,11 @@ fn run() -> io::Result<()> {
 
     let cmd_pos = args
         .iter()
-        .position(|a| a == "set" || a == "get")
+        .position(|a| a == "set" || a == "get" || a == "delete")
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "command must be 'set' or 'get'",
+                "command must be 'set', 'get', or 'delete'",
             )
         })?;
     let peers: Vec<String> = args[..cmd_pos].to_vec();
@@ -47,10 +48,13 @@ fn run() -> io::Result<()> {
         "get" if cmd_args.len() == 2 => ClientRequest::Get {
             key: cmd_args[1].clone(),
         },
+        "delete" if cmd_args.len() == 2 => ClientRequest::Delete {
+            key: cmd_args[1].clone(),
+        },
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: raft-client <peer>... set <key> <value> | raft-client <peer>... get <key>",
+                "usage: raft-client <peer>... set <key> <value> | raft-client <peer>... get <key> | raft-client <peer>... delete <key>",
             ));
         }
     };

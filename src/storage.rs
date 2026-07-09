@@ -1,4 +1,4 @@
-use crate::{LogEntry, LogIndex, Node, NodeId, Term};
+use crate::{LogEntry, LogIndex, MemoryStateMachine, Node, NodeId, StateMachine, Term};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -13,7 +13,7 @@ pub struct DurableState {
 }
 
 impl DurableState {
-    pub fn from_node(node: &Node) -> Self {
+    pub fn from_node<S: StateMachine>(node: &Node<S>) -> Self {
         Self {
             current_term: node.current_term(),
             voted_for: node.voted_for(),
@@ -24,25 +24,37 @@ impl DurableState {
 }
 
 pub fn load_node(path: &Path, id: NodeId, peers: Vec<NodeId>) -> io::Result<Node> {
+    load_node_with_state_machine(path, id, peers, MemoryStateMachine::new())
+}
+
+pub fn load_node_with_state_machine<S: StateMachine>(
+    path: &Path,
+    id: NodeId,
+    peers: Vec<NodeId>,
+    state_machine: S,
+) -> io::Result<Node<S>> {
     match fs::read(path) {
         Ok(bytes) => {
             let state: DurableState = bincode::deserialize(&bytes)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            Ok(Node::from_parts(
+            Ok(Node::from_parts_with_state_machine(
                 id,
                 peers,
                 state.current_term,
                 state.voted_for,
                 state.log,
                 state.commit_index,
+                state_machine,
             ))
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Node::new(id, peers)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Ok(Node::new_with_state_machine(id, peers, state_machine))
+        }
         Err(err) => Err(err),
     }
 }
 
-pub fn save_node(path: &Path, node: &Node) -> io::Result<()> {
+pub fn save_node<S: StateMachine>(path: &Path, node: &Node<S>) -> io::Result<()> {
     save_state(path, &DurableState::from_node(node))
 }
 
@@ -106,6 +118,6 @@ mod tests {
         assert_eq!(loaded.current_term(), 4);
         assert_eq!(loaded.voted_for(), Some(2));
         assert_eq!(loaded.log(), node.log());
-        assert_eq!(loaded.get("foo"), Some("bar"));
+        assert_eq!(loaded.get("foo"), Some("bar".to_string()));
     }
 }
