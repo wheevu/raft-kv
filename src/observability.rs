@@ -43,10 +43,13 @@ impl NodeMetrics {
             "raft_leader_changes_total",
             "Total observed leader changes.",
         )?;
-        let writes_total = int_counter("raft_writes_total", "Total accepted client writes.")?;
+        let writes_total = int_counter(
+            "raft_writes_total",
+            "Client writes whose handlers observed leader-side commit and apply.",
+        )?;
         let write_latency = Histogram::with_opts(HistogramOpts::new(
             "raft_write_latency_seconds",
-            "Latency to accept a client write into the leader's local Raft log, not end-to-end commit latency.",
+            "Latency for a client write to commit and apply on the leader.",
         ))
         .map_err(io::Error::other)?;
         let replication_lag = IntGaugeVec::new(

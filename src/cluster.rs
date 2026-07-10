@@ -2,6 +2,8 @@ use crate::node::Node;
 use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+const CLIENT_WRITE_TIMEOUT_MS: u64 = 2_000;
+
 #[derive(Debug)]
 pub struct Cluster {
     nodes: HashMap<NodeId, Node>,
@@ -32,6 +34,11 @@ impl Cluster {
 
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[&id]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn node_mut_for_test(&mut self, id: NodeId) -> &mut Node {
+        self.nodes.get_mut(&id).unwrap()
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &Node)> {
@@ -90,6 +97,12 @@ impl Cluster {
                 response: None,
             };
         }
+        if matches!(
+            request,
+            ClientRequest::Set { .. } | ClientRequest::Delete { .. }
+        ) {
+            return self.propose_write(leader, request);
+        }
         let (reply, messages) = self
             .nodes
             .get_mut(&leader)
@@ -97,6 +110,61 @@ impl Cluster {
             .handle_client_request(request);
         self.enqueue(messages);
         reply
+    }
+
+    fn propose_write(&mut self, leader: NodeId, request: ClientRequest) -> ClientReply {
+        let (write, messages) = match self
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .start_client_write(request)
+        {
+            Ok(write) => write,
+            Err(reply) => return reply,
+        };
+        self.enqueue(messages);
+        let deadline = self.now_ms + CLIENT_WRITE_TIMEOUT_MS;
+        while self.now_ms <= deadline {
+            let node = self.node(leader);
+            if node.write_committed_and_applied(write) {
+                return ClientReply {
+                    success: true,
+                    leader_id: Some(leader),
+                    response: Some("committed".to_string()),
+                };
+            }
+            if node.role() != Role::Leader
+                || node.current_term() != write.term
+                || self.is_stopped(leader)
+            {
+                return ClientReply {
+                    success: false,
+                    leader_id: self.leader(),
+                    response: None,
+                };
+            }
+            self.step();
+        }
+        ClientReply {
+            success: false,
+            leader_id: self.node(leader).leader_id(),
+            response: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_write_for_test(
+        &mut self,
+        leader: NodeId,
+        request: ClientRequest,
+    ) -> Result<crate::PendingWrite, ClientReply> {
+        let (write, messages) = self
+            .nodes
+            .get_mut(&leader)
+            .unwrap()
+            .start_client_write(request)?;
+        self.enqueue(messages);
+        Ok(write)
     }
 
     pub fn run_until<F>(&mut self, deadline_ms: u64, mut predicate: F) -> bool

@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(800);
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_millis(75);
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -108,24 +111,51 @@ fn handle_connection(
                 ClientRequest::Set { .. } | ClientRequest::Delete { .. }
             );
             let started = Instant::now();
-            let (reply, messages) = {
-                let mut runtime = shared.lock().expect("node mutex poisoned");
-                let (mut reply, messages) = runtime.node.handle_client_request(request);
-                if let Err(err) = runtime.persist_if_changed(&config.state_path) {
-                    tracing::error!(error = %err, "persist client write failed");
-                    reply.success = false;
-                    reply.response = None;
-                }
-                if is_write && reply.success {
+            let reply = if is_write {
+                let (write, messages) = {
+                    let mut runtime = shared.lock().expect("node mutex poisoned");
+                    let (write, messages) = match runtime.node.start_client_write(request) {
+                        Ok(write) => write,
+                        Err(reply) => return write_reply_frame(&mut stream, reply),
+                    };
+                    if let Err(err) = runtime.persist_if_changed(&config.state_path) {
+                        tracing::error!(error = %err, "persist client write failed");
+                        let reply = raft_kv::ClientReply {
+                            success: false,
+                            leader_id: Some(config.id),
+                            response: None,
+                        };
+                        return write_reply_frame(&mut stream, reply);
+                    }
+                    runtime.refresh_metrics();
+                    (write, messages)
+                };
+                send_all(&config.peers, messages);
+                let reply = wait_for_write(&shared, &config, write, started);
+                if reply.success {
+                    let mut runtime = shared.lock().expect("node mutex poisoned");
                     runtime
                         .metrics
                         .observe_write(started.elapsed().as_secs_f64());
+                    runtime.refresh_metrics();
                 }
-                runtime.refresh_metrics();
-                (reply, messages)
+                reply
+            } else {
+                let (reply, messages) = {
+                    let mut runtime = shared.lock().expect("node mutex poisoned");
+                    let (mut reply, messages) = runtime.node.handle_client_request(request);
+                    if let Err(err) = runtime.persist_if_changed(&config.state_path) {
+                        tracing::error!(error = %err, "persist client request failed");
+                        reply.success = false;
+                        reply.response = None;
+                    }
+                    runtime.refresh_metrics();
+                    (reply, messages)
+                };
+                send_all(&config.peers, messages);
+                reply
             };
             write_reply_frame(&mut stream, reply)?;
-            send_all(&config.peers, messages);
         }
         WireMessage::ClientReply(_) => {
             return Err(io::Error::new(
@@ -137,6 +167,42 @@ fn handle_connection(
     Ok(())
 }
 
+fn wait_for_write(
+    shared: &Arc<Mutex<Runtime>>,
+    config: &Config,
+    write: raft_kv::PendingWrite,
+    started: Instant,
+) -> raft_kv::ClientReply {
+    while started.elapsed() < CLIENT_WRITE_TIMEOUT {
+        {
+            let mut runtime = shared.lock().expect("node mutex poisoned");
+            if runtime.node.write_committed_and_applied(write) {
+                return raft_kv::ClientReply {
+                    success: true,
+                    leader_id: Some(config.id),
+                    response: Some("committed".to_string()),
+                };
+            }
+            if runtime.node.role() != Role::Leader || runtime.node.current_term() != write.term {
+                return raft_kv::ClientReply {
+                    success: false,
+                    leader_id: runtime.node.leader_id(),
+                    response: None,
+                };
+            }
+            runtime.refresh_metrics();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut runtime = shared.lock().expect("node mutex poisoned");
+    runtime.refresh_metrics();
+    raft_kv::ClientReply {
+        success: false,
+        leader_id: runtime.node.leader_id(),
+        response: None,
+    }
+}
+
 fn send_all(peers: &HashMap<NodeId, String>, messages: Vec<raft_kv::Message>) {
     let mut per_peer: HashMap<NodeId, Vec<raft_kv::Message>> = HashMap::new();
     for message in messages {
@@ -146,16 +212,21 @@ fn send_all(peers: &HashMap<NodeId, String>, messages: Vec<raft_kv::Message>) {
         let Some(addr) = peers.get(&peer) else {
             continue;
         };
-        match TcpStream::connect(addr) {
+        let Ok(addr) = addr.parse::<SocketAddr>() else {
+            tracing::warn!(addr, "invalid peer address");
+            continue;
+        };
+        match TcpStream::connect_timeout(&addr, PEER_CONNECT_TIMEOUT) {
             Ok(mut stream) => {
+                let _ = stream.set_write_timeout(Some(PEER_CONNECT_TIMEOUT));
                 for message in msgs {
                     if let Err(err) = write_peer_frame(&mut stream, message) {
-                        tracing::warn!(addr, error = %err, "send failed");
+                        tracing::warn!(%addr, error = %err, "send failed");
                         break;
                     }
                 }
             }
-            Err(err) => tracing::warn!(addr, error = %err, "connect failed"),
+            Err(err) => tracing::warn!(%addr, error = %err, "connect failed"),
         }
     }
 }

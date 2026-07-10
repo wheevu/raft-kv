@@ -9,7 +9,7 @@ pub mod types;
 
 // Re-export public API from sub-modules.
 pub use cluster::Cluster;
-pub use node::Node;
+pub use node::{Node, PendingWrite};
 pub use state_machine::{MemoryStateMachine, StateMachine};
 pub use types::{
     AppendEntries, AppendEntriesReply, ClientReply, ClientRequest, Command, LogEntry, LogIndex,
@@ -60,6 +60,8 @@ mod tests {
             },
         );
         assert!(reply.success);
+        assert_eq!(reply.response, Some("committed".to_string()));
+        assert!(cluster.node(leader).last_applied() >= cluster.node(leader).commit_index());
         assert!(cluster.run_until(1000, |cluster| {
             cluster
                 .nodes()
@@ -111,21 +113,19 @@ mod tests {
                 value: "value".to_string(),
             },
         );
-        assert!(reply.success);
-        cluster.run_for(500);
+        assert!(!reply.success);
         assert!(cluster.node(old_leader).get("lost").is_none());
 
-        assert!(cluster.run_until(1200, |cluster| {
+        let election_deadline = cluster.now() + 1200;
+        assert!(cluster.run_until(election_deadline, |cluster| {
             majority
                 .iter()
                 .any(|&id| cluster.node(id).role() == Role::Leader)
         }));
         cluster.heal();
-        assert!(cluster.run_until(2500, |cluster| {
-            cluster
-                .nodes()
-                .filter(|(_, node)| node.id() != old_leader)
-                .all(|(_, node)| node.get("lost").is_none())
+        let heal_deadline = cluster.now() + 2500;
+        assert!(cluster.run_until(heal_deadline, |cluster| {
+            cluster.nodes().all(|(_, node)| node.get("lost").is_none())
         }));
     }
 
@@ -135,20 +135,118 @@ mod tests {
         assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
         let leader = cluster.leader().unwrap();
         for index in 0..10 {
-            let reply = cluster.propose(
-                leader,
-                ClientRequest::Set {
-                    key: format!("k{index}"),
-                    value: format!("v{index}"),
-                },
-            );
-            assert!(reply.success);
+            let write = cluster
+                .start_write_for_test(
+                    leader,
+                    ClientRequest::Set {
+                        key: format!("k{index}"),
+                        value: format!("v{index}"),
+                    },
+                )
+                .unwrap();
+            assert!(!cluster.node(leader).write_committed_and_applied(write));
         }
         assert!(cluster.run_until(2500, |cluster| (0..10).all(|index| {
             cluster
                 .nodes()
                 .all(|(_, node)| node.get(&format!("k{index}")) == Some(format!("v{index}")))
         })));
+    }
+
+    #[test]
+    fn client_write_does_not_ack_before_majority_commit_and_apply() {
+        let mut cluster = Cluster::new(5);
+        assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
+        let leader = cluster.leader().unwrap();
+        let write = cluster
+            .start_write_for_test(
+                leader,
+                ClientRequest::Set {
+                    key: "early".to_string(),
+                    value: "ack".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(!cluster.node(leader).write_committed_and_applied(write));
+        assert!(cluster.node(leader).get("early").is_none());
+        assert!(cluster.run_until(1000, |cluster| {
+            cluster.node(leader).write_committed_and_applied(write)
+        }));
+    }
+
+    #[test]
+    fn handle_client_request_does_not_append_write_without_proposal_lifecycle() {
+        let mut cluster = Cluster::new(5);
+        assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
+        let leader = cluster.leader().unwrap();
+        let before = cluster.node(leader).last_log_index();
+        let (reply, messages) =
+            cluster
+                .node_mut_for_test(leader)
+                .handle_client_request(ClientRequest::Set {
+                    key: "direct".to_string(),
+                    value: "write".to_string(),
+                });
+
+        assert!(!reply.success);
+        assert!(messages.is_empty());
+        assert_eq!(cluster.node(leader).last_log_index(), before);
+    }
+
+    #[test]
+    fn committed_and_applied_check_is_independent_of_current_role() {
+        let write = PendingWrite { index: 1, term: 3 };
+        let node = Node::from_parts(
+            0,
+            vec![1, 2],
+            4,
+            None,
+            vec![LogEntry {
+                term: 3,
+                command: Command::Set {
+                    key: "role".to_string(),
+                    value: "independent".to_string(),
+                },
+            }],
+            1,
+        );
+
+        assert_eq!(node.role(), Role::Follower);
+        assert!(node.write_committed_and_applied(write));
+    }
+
+    #[test]
+    fn pending_write_is_not_successful_after_leader_steps_down() {
+        let mut cluster = Cluster::new(5);
+        assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
+        let old_leader = cluster.leader().unwrap();
+        let write = cluster
+            .start_write_for_test(
+                old_leader,
+                ClientRequest::Set {
+                    key: "stepped_down".to_string(),
+                    value: "lost".to_string(),
+                },
+            )
+            .unwrap();
+
+        let majority: Vec<_> = (0..5).filter(|&id| id != old_leader).collect();
+        cluster.partition(&[vec![old_leader], majority]);
+        let election_deadline = cluster.now() + 1200;
+        assert!(cluster.run_until(election_deadline, |cluster| {
+            cluster
+                .nodes()
+                .any(|(id, node)| id != old_leader && node.role() == Role::Leader)
+        }));
+        cluster.heal();
+        let step_down_deadline = cluster.now() + 2500;
+        assert!(cluster.run_until(step_down_deadline, |cluster| {
+            cluster.node(old_leader).role() == Role::Follower
+        }));
+
+        assert!(!cluster.node(old_leader).write_committed_and_applied(write));
+        assert!(cluster.node(old_leader).get("stepped_down").is_none());
     }
 
     #[test]

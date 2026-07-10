@@ -58,6 +58,7 @@ pub struct AppendEntriesReply {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ClientRequest {
     Get { key: String },
+    LocalGet { key: String },
     Set { key: String, value: String },
     Delete { key: String },
 }

@@ -3,11 +3,8 @@
 | cluster size tested | 5 nodes |
 | election timeout | 150–300 ms |
 | heartbeat interval | 50 ms |
-| first leader elected | 88 ms simulated |
-| failover after leader kill | 122 ms simulated |
-| write visible on all nodes | 26 ms simulated |
-| simulator write throughput | 3921 writes/sec |
-| benchmark writes | 1000 writes |
-| benchmark wall time | 255 ms |
+| first leader elected | 176 ms simulated |
+| failover after leader kill | 244 ms simulated |
+| write visible on all nodes | 52 ms simulated |
 | fault tolerance | 2 failed nodes in a 5-node cluster |
-| process-level TCP tests | 1 kill/restart test |
+| process-level TCP tests | 3 integration tests |

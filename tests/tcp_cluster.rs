@@ -52,6 +52,10 @@ fn tcp_process_cluster_elects_replicates_and_recovers_after_leader_kill() {
 
     let restarted = spawn_node(dir.path(), leader, &peers, &metrics);
     children.insert(leader, restarted);
+    let restarted_reply = wait_for_local_get(&peers[&leader], "foo", Duration::from_secs(5))
+        .expect("restarted node should expose local state directly");
+    assert!(restarted_reply.success);
+    assert_eq!(restarted_reply.response, Some("bar".to_string()));
     assert_eq!(
         wait_for_get(&peers, "foo", Duration::from_secs(5)),
         Some("bar".to_string())
@@ -160,6 +164,24 @@ fn wait_for_get(peers: &HashMap<NodeId, String>, key: &str, timeout: Duration) -
             {
                 return reply.response;
             }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+fn wait_for_local_get(addr: &str, key: &str, timeout: Duration) -> Option<ClientReply> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(reply) = send_client(
+            addr,
+            ClientRequest::LocalGet {
+                key: key.to_string(),
+            },
+        ) && reply.success
+            && reply.response.is_some()
+        {
+            return Some(reply);
         }
         thread::sleep(Duration::from_millis(50));
     }

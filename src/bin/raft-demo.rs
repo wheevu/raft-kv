@@ -3,7 +3,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
 
 fn main() -> ExitCode {
     match run() {
@@ -148,6 +147,7 @@ fn metrics_table() -> String {
     let mut replication = Cluster::new(5);
     assert!(replication.run_until(600, |cluster| cluster.leader().is_some()));
     let leader = replication.leader().expect("leader");
+    let replication_started = replication.now();
     let _ = replication.propose(
         leader,
         ClientRequest::Set {
@@ -155,54 +155,16 @@ fn metrics_table() -> String {
             value: "bar".to_string(),
         },
     );
-    let replication_ms = first_time_until(&mut replication, 1000, |cluster| {
+    let _ = first_time_until(&mut replication, 1000, |cluster| {
         cluster
             .nodes()
             .all(|(_, node)| node.get("foo") == Some("bar".to_string()))
     });
-    let bench = benchmark_simulated_writes(3, 1_000);
+    let replication_ms = replication.now().saturating_sub(replication_started);
 
     format!(
-        "| metric | value |\n|---|---:|\n| cluster size tested | 5 nodes |\n| election timeout | 150–300 ms |\n| heartbeat interval | 50 ms |\n| first leader elected | {election_ms} ms simulated |\n| failover after leader kill | {failover_ms} ms simulated |\n| write visible on all nodes | {replication_ms} ms simulated |\n| simulator write throughput | {} writes/sec |\n| benchmark writes | {} writes |\n| benchmark wall time | {} ms |\n| fault tolerance | 2 failed nodes in a 5-node cluster |\n| process-level TCP tests | 1 kill/restart test |\n",
-        bench.writes_per_second,
-        bench.writes,
-        bench.elapsed.as_millis()
+        "| metric | value |\n|---|---:|\n| cluster size tested | 5 nodes |\n| election timeout | 150–300 ms |\n| heartbeat interval | 50 ms |\n| first leader elected | {election_ms} ms simulated |\n| failover after leader kill | {failover_ms} ms simulated |\n| write visible on all nodes | {replication_ms} ms simulated |\n| fault tolerance | 2 failed nodes in a 5-node cluster |\n| process-level TCP tests | 3 integration tests |\n"
     )
-}
-
-fn benchmark_simulated_writes(cluster_size: usize, writes: usize) -> BenchResult {
-    let mut cluster = Cluster::new(cluster_size);
-    assert!(cluster.run_until(600, |cluster| cluster.leader().is_some()));
-    let leader = cluster.leader().expect("leader");
-    let started = Instant::now();
-    for index in 0..writes {
-        let reply = cluster.propose(
-            leader,
-            ClientRequest::Set {
-                key: format!("bench-{index}"),
-                value: index.to_string(),
-            },
-        );
-        assert!(reply.success);
-    }
-    assert!(cluster.run_until(20_000, |cluster| {
-        cluster
-            .nodes()
-            .all(|(_, node)| node.get(&format!("bench-{}", writes - 1)).is_some())
-    }));
-    let elapsed = started.elapsed();
-    let writes_per_second = ((writes as f64) / elapsed.as_secs_f64()).round() as u64;
-    BenchResult {
-        writes,
-        elapsed,
-        writes_per_second,
-    }
-}
-
-struct BenchResult {
-    writes: usize,
-    elapsed: Duration,
-    writes_per_second: u64,
 }
 
 fn first_time_until(
@@ -210,13 +172,14 @@ fn first_time_until(
     deadline_ms: u64,
     done: impl Fn(&Cluster) -> bool,
 ) -> u64 {
-    for time in 0..=deadline_ms {
+    let started = cluster.now();
+    while cluster.now().saturating_sub(started) <= deadline_ms {
         if done(cluster) {
-            return time;
+            return cluster.now().saturating_sub(started);
         }
         cluster.run_for(1);
     }
-    deadline_ms
+    cluster.now().saturating_sub(started)
 }
 
 fn command_label(command: &Command) -> String {

@@ -29,6 +29,12 @@ pub struct Node<S: StateMachine = MemoryStateMachine> {
     term_start_index: LogIndex,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingWrite {
+    pub index: LogIndex,
+    pub term: Term,
+}
+
 impl Node<MemoryStateMachine> {
     pub fn new(id: NodeId, peers: Vec<NodeId>) -> Self {
         Self::new_with_state_machine(id, peers, MemoryStateMachine::new())
@@ -190,12 +196,47 @@ impl<S: StateMachine> Node<S> {
     }
 
     pub fn handle_client_request(&mut self, request: ClientRequest) -> (ClientReply, Vec<Message>) {
+        if let ClientRequest::LocalGet { key } = &request {
+            return (
+                ClientReply {
+                    success: true,
+                    leader_id: self.leader_id,
+                    response: match self.state_machine.get(key) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return (
+                                ClientReply {
+                                    success: false,
+                                    leader_id: self.leader_id,
+                                    response: None,
+                                },
+                                Vec::new(),
+                            );
+                        }
+                    },
+                },
+                Vec::new(),
+            );
+        }
         if self.role != Role::Leader {
             return (
                 ClientReply {
                     success: false,
                     leader_id: self.leader_id,
                     response: None,
+                },
+                Vec::new(),
+            );
+        }
+        if matches!(
+            request,
+            ClientRequest::Set { .. } | ClientRequest::Delete { .. }
+        ) {
+            return (
+                ClientReply {
+                    success: false,
+                    leader_id: Some(self.id),
+                    response: Some("pending write requires proposal lifecycle".to_string()),
                 },
                 Vec::new(),
             );
@@ -232,15 +273,33 @@ impl<S: StateMachine> Node<S> {
                 Vec::new(),
             );
         }
+        unreachable!("all client request variants handled")
+    }
+
+    pub fn start_client_write(
+        &mut self,
+        request: ClientRequest,
+    ) -> Result<(PendingWrite, Vec<Message>), ClientReply> {
+        if self.role != Role::Leader {
+            return Err(ClientReply {
+                success: false,
+                leader_id: self.leader_id,
+                response: None,
+            });
+        }
         let command = match request {
             ClientRequest::Set { key, value } => Command::Set { key, value },
             ClientRequest::Delete { key } => Command::Delete { key },
-            ClientRequest::Get { .. } => unreachable!(),
+            ClientRequest::Get { .. } | ClientRequest::LocalGet { .. } => {
+                return Err(ClientReply {
+                    success: false,
+                    leader_id: Some(self.id),
+                    response: None,
+                });
+            }
         };
-        self.log.push(LogEntry {
-            term: self.current_term,
-            command,
-        });
+        let term = self.current_term;
+        self.log.push(LogEntry { term, command });
         let last = self.last_log_index();
         self.match_index.insert(self.id, last);
         let messages = self
@@ -248,14 +307,13 @@ impl<S: StateMachine> Node<S> {
             .iter()
             .map(|&peer| self.append_entries_for(peer))
             .collect();
-        (
-            ClientReply {
-                success: true,
-                leader_id: Some(self.id),
-                response: Some("accepted".to_string()),
-            },
-            messages,
-        )
+        Ok((PendingWrite { index: last, term }, messages))
+    }
+
+    pub fn write_committed_and_applied(&self, write: PendingWrite) -> bool {
+        self.term_at(write.index) == Some(write.term)
+            && self.commit_index >= write.index
+            && self.last_applied >= write.index
     }
 
     fn start_election(&mut self, now_ms: u64) -> Vec<Message> {
